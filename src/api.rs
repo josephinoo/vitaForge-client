@@ -45,6 +45,56 @@ pub struct App {
     pub average_rating: Option<f64>,
     #[serde(default)]
     pub install_count: Option<i64>,
+    #[serde(default)]
+    pub description: Option<String>,
+    #[serde(default)]
+    pub long_description: Option<String>,
+    #[serde(default)]
+    pub requirements: Option<String>,
+    #[serde(default)]
+    pub changelog: Option<String>,
+    #[serde(default)]
+    pub screenshot_urls: Vec<String>,
+    /// Package / extra-data size in bytes (the server sends them as strings).
+    #[serde(default)]
+    pub size: Option<String>,
+    #[serde(default)]
+    pub data_size: Option<String>,
+    #[serde(default)]
+    pub release_date: Option<String>,
+    #[serde(default)]
+    pub ratings_count: Option<i64>,
+    #[serde(default)]
+    pub likes_count: Option<i64>,
+}
+
+/// Sidebar categories, same set and order as the Vita app.
+pub const CATEGORIES: [&str; 7] = ["Emulator", "Original", "PS Vita Game", "Plugin", "Port", "Utility", "Theme"];
+
+/// Normalised category (mirrors the Vita app's `Category::from_api`); None = "Other"/"Tool", only under Todo.
+pub fn category(a: &App) -> Option<&'static str> {
+    let kind = a.kind.as_deref().unwrap_or("").trim().to_lowercase();
+    match kind.as_str() {
+        "plugin" => return Some("Plugin"),
+        "theme" => return Some("Theme"),
+        _ => {}
+    }
+    match a.category.as_deref().unwrap_or("").trim().to_lowercase().as_str() {
+        "emulator" | "emulators" => Some("Emulator"),
+        "original" => Some("Original"),
+        "game" | "games" | "ps vita game" => Some("PS Vita Game"),
+        "plugin" | "plugins" => Some("Plugin"),
+        "port" | "ports" => Some("Port"),
+        "utility" | "utilities" => Some("Utility"),
+        "tool" | "tools" => None,
+        _ if kind == "psv_game" => Some("PS Vita Game"),
+        _ => None,
+    }
+}
+
+/// The Vita app drops entries without a usable download URL.
+pub fn installable(a: &App) -> bool {
+    a.download_url.as_deref().is_some_and(|u| !u.is_empty() && !u.eq_ignore_ascii_case("missing"))
 }
 
 #[derive(Deserialize, Serialize, Debug, PartialEq)]
@@ -74,6 +124,16 @@ pub fn snapshot() -> Result<Vec<App>, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn category_normalises_like_the_vita_app() {
+        let c = |cat: &str, kind: &str| category(&App { category: Some(cat.into()), kind: Some(kind.into()), ..Default::default() });
+        assert_eq!(c("Games", "app"), Some("PS Vita Game"));
+        assert_eq!(c("port", "app"), Some("Port"));
+        assert_eq!(c("Game Port", "app"), None);
+        assert_eq!(c("Original", "plugin"), Some("Plugin"));
+        assert_eq!(c("", "psv_game"), Some("PS Vita Game"));
+    }
+
     #[test]
     fn app_tolerates_missing_fields() {
         let a: App = serde_json::from_str(r#"{"id":1,"name":"X","type":"psv_game"}"#).unwrap();

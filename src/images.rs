@@ -75,6 +75,22 @@ fn source(a: &App) -> Option<(String, &'static str)> {
         .map(|t| (format!("{base}/images/cover/{t}?size=thumb&format=jpeg"), "jpg"))
 }
 
+/// Screenshot `idx` of `a`, same fetch-once behaviour as `path`.
+pub fn shot(a: &App, idx: usize) -> Option<PathBuf> {
+    let u = a.screenshot_urls.get(idx)?;
+    let url = if u.starts_with("http") { u.clone() } else { format!("{}{u}", origin()?) };
+    let ext = if url.to_lowercase().split('?').next().is_some_and(|b| b.ends_with(".jpg") || b.ends_with(".jpeg")) { "jpg" } else { "png" };
+    let dest = std::env::temp_dir().join("vitaforge-client-img").join(format!("{}-s{idx}.{ext}", a.id));
+    if dest.exists() {
+        return Some(dest);
+    }
+    let p = pool();
+    if p.seen.lock().unwrap().insert(dest.clone()) {
+        let _ = p.tx.send(Job { url, dest });
+    }
+    None
+}
+
 /// Cached file if present; otherwise queue a fetch (once) and return None.
 pub fn path(a: &App) -> Option<PathBuf> {
     let (url, ext) = source(a)?;

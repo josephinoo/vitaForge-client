@@ -14,8 +14,8 @@ fn dir() -> PathBuf {
 pub fn catalog() -> Vec<App> {
     let d = dir();
     let cached = || -> Option<(Version, Vec<App>)> {
-        Some((serde_json::from_slice(&fs::read(d.join("version-v2.json")).ok()?).ok()?,
-              serde_json::from_slice(&fs::read(d.join("catalog-v2.json")).ok()?).ok()?))
+        Some((serde_json::from_slice(&fs::read(d.join("version-v3.json")).ok()?).ok()?,
+              serde_json::from_slice(&fs::read(d.join("catalog-v3.json")).ok()?).ok()?))
     };
     let old = cached();
     match api::version() {
@@ -23,8 +23,8 @@ pub fn catalog() -> Vec<App> {
         Ok(v) => match api::snapshot() {
             Ok(apps) => {
                 let _ = fs::create_dir_all(&d);
-                let _ = fs::write(d.join("catalog-v2.json"), serde_json::to_vec(&apps).unwrap_or_default());
-                let _ = fs::write(d.join("version-v2.json"), serde_json::to_vec(&v).unwrap_or_default());
+                let _ = fs::write(d.join("catalog-v3.json"), serde_json::to_vec(&apps).unwrap_or_default());
+                let _ = fs::write(d.join("version-v3.json"), serde_json::to_vec(&v).unwrap_or_default());
                 apps
             }
             Err(_) => old.map(|o| o.1).unwrap_or_default(),
