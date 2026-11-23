@@ -1,3 +1,5 @@
+#![cfg_attr(windows, windows_subsystem = "windows")] // no console window on Windows
+
 use gpui_kit::component::button::Button;
 use gpui_kit::component::input::{Input, InputEvent, InputState};
 use gpui_kit::*;
@@ -6,7 +8,7 @@ use std::{
     sync::{atomic::Ordering::Relaxed, Arc, Mutex},
     time::{Duration, Instant},
 };
-use vitaforge_client::{api, cache, download::Progress, images, install, vita};
+use vitaforge_client::{account, api, cache, download::Progress, i18n::{self, t, t1}, images, install, vita};
 
 const BG: u32 = 0x070c18;
 const HEADER: u32 = 0x0c1426;
@@ -35,7 +37,7 @@ fn icon(name: &str, size: f32, color: u32) -> Svg {
     svg().path(format!("icons/{name}.svg")).size(px(size)).flex_none().text_color(rgb(color))
 }
 
-fn empty(name: &'static str, text: &'static str) -> AnyElement {
+fn empty(name: &'static str, text: String) -> AnyElement {
     div().size_full().flex().flex_col().items_center().justify_center().gap_2()
         .child(icon(name, 44., DIM))
         .child(div().text_color(rgb(DIM)).child(text))
@@ -47,6 +49,7 @@ enum Tab {
     Catalog,
     Library,
     Transfers,
+    Settings,
 }
 
 struct Transfer {
@@ -72,6 +75,11 @@ struct Main {
     vita: Option<vita::Vita>,
     transfers: Vec<Transfer>,
     status: SharedString,
+    session: Option<account::Session>,
+    user_in: Entity<InputState>,
+    pass_in: Entity<InputState>,
+    login_err: SharedString,
+    logging: bool,
     _sub: Subscription,
 }
 
@@ -91,7 +99,9 @@ fn size(n: u64) -> String {
 
 impl Main {
     fn new(window: &mut Window, cx: &mut Context<Self>) -> Self {
-        let query = cx.new(|cx| InputState::new(window, cx).placeholder("Buscar…"));
+        let query = cx.new(|cx| InputState::new(window, cx).placeholder(t("search")));
+        let user_in = cx.new(|cx| InputState::new(window, cx).placeholder(t("username")));
+        let pass_in = cx.new(|cx| InputState::new(window, cx).placeholder(t("password")).masked(true));
         let _sub = cx.subscribe(&query, |this: &mut Self, _, e: &InputEvent, cx| {
             if matches!(e, InputEvent::Change) {
                 this.refilter(cx);
@@ -132,6 +142,11 @@ impl Main {
             vita: vita::find(),
             transfers: vec![],
             status: "".into(),
+            session: account::load(),
+            user_in,
+            pass_in,
+            login_err: "".into(),
+            logging: false,
             _sub,
         }
     }
@@ -145,8 +160,8 @@ impl Main {
             .collect();
         self.status = match (apps.is_empty(), api::base()) {
             (_, Err(e)) => e.into(),
-            (true, _) => "Sin conexión al catálogo".into(),
-            _ => "Catálogo cargado".into(),
+            (true, _) => t("no-connection").into(),
+            _ => t("catalog-loaded").into(),
         };
         let top = |key: &dyn Fn(&api::App) -> i64| {
             let mut v: Vec<usize> = (0..apps.len()).collect();
@@ -211,26 +226,99 @@ impl Main {
 
     fn start_install(&mut self, i: usize) {
         let Some(root) = self.vita.as_ref().map(|v| v.root.clone()) else {
-            self.status = "Conecta la Vita por USB primero".into();
+            self.status = t("connect-vita-first").into();
             return;
         };
         let app = self.apps[i].clone();
-        let t = Transfer { name: app.name.clone(), progress: Arc::default(), result: Arc::default() };
-        let (p, r) = (t.progress.clone(), t.result.clone());
+        let tr = Transfer { name: app.name.clone(), progress: Arc::default(), result: Arc::default() };
+        let (p, r) = (tr.progress.clone(), tr.result.clone());
         std::thread::spawn(move || {
             let msg = match install::install(&app, &root, &p) {
                 Ok(m) => m,
-                Err(e) => format!("Error: {e}"),
+                Err(e) => format!("{}: {e}", t("error")),
             };
             *r.lock().unwrap() = Some(msg);
         });
-        self.transfers.push(t);
+        self.transfers.push(tr);
         self.tab = Tab::Transfers;
+    }
+
+    fn sign_in(&mut self, cx: &mut Context<Self>) {
+        let (u, p) = (self.user_in.read(cx).value().trim().to_string(), self.pass_in.read(cx).value().to_string());
+        if u.is_empty() || p.is_empty() {
+            self.login_err = t("login-missing").into();
+            return;
+        }
+        self.logging = true;
+        self.login_err = "".into();
+        cx.spawn(async move |this, cx| {
+            let r = cx.background_executor().spawn(async move { account::login(&u, &p) }).await;
+            this.update(cx, |t_, cx| {
+                t_.logging = false;
+                match r {
+                    Ok(s) => t_.session = Some(s),
+                    Err(e) => t_.login_err = format!("{}: {e}", t("login-failed")).into(),
+                }
+                cx.notify();
+            })
+            .ok();
+        })
+        .detach();
+    }
+
+    fn settings(&self, cx: &mut Context<Self>) -> AnyElement {
+        let card = |title: String| {
+            div().p_4().gap_3().flex().flex_col().rounded(px(16.)).bg(rgb(CARD)).border_1().border_color(rgb(LINE))
+                .child(div().text_xs().text_color(rgb(DIM)).child(title.to_uppercase()))
+        };
+        let account = match &self.session {
+            Some(s) => card(t("account"))
+                .child(div().flex().items_center().gap_2().child(t1("signed-in-as", &[("user", s.username.clone())])).children((!s.role.is_empty()).then(|| chip(s.role.clone(), ACCENT))))
+                .child(Button::new("sign-out").label(t("sign-out")).on_click(cx.listener(|this, _, _, cx| {
+                    account::logout();
+                    this.session = None;
+                    cx.notify();
+                }))),
+            None => card(t("account"))
+                .child(div().w(px(320.)).child(Input::new(&self.user_in)))
+                .child(div().w(px(320.)).child(Input::new(&self.pass_in)))
+                .child(Button::new("sign-in").label(t(if self.logging { "signing-in" } else { "sign-in" })).on_click(cx.listener(|this, _, _, cx| {
+                    if !this.logging {
+                        this.sign_in(cx);
+                    }
+                    cx.notify();
+                })))
+                .children((!self.login_err.is_empty()).then(|| div().text_sm().text_color(rgb(ERR)).child(self.login_err.clone()))),
+        };
+        let langs = card(t("language")).child(div().flex().flex_wrap().gap_2().children(i18n::Lang::ALL.into_iter().map(|l| {
+            let on = i18n::current() == l;
+            div().id(l.code()).px_4().py(px(6.)).rounded_full().text_sm().cursor_pointer()
+                .bg(rgb(if on { ACCENT } else { HOVER }))
+                .child(l.label())
+                .on_click(cx.listener(move |this, _, _, cx| {
+                    i18n::set(l);
+                    this.status = "".into();
+                    cx.notify();
+                }))
+        })));
+        let device = card(t("device"))
+            .child(div().text_sm().text_color(rgb(DIM)).child(match &self.vita {
+                Some(v) => v.root.display().to_string(),
+                None => t("vita-none"),
+            }))
+            .child(Button::new("rescan").label(t("find-vita")).on_click(cx.listener(|this, _, _, cx| {
+                this.rescan();
+                cx.notify();
+            })));
+        let about = card(t("about")).child(div().text_sm().text_color(rgb(DIM)).child(format!("VitaForge Client v{}", env!("CARGO_PKG_VERSION"))));
+        div().id("settings").size_full().px_6().pb_6().gap_4().flex().flex_col().overflow_y_scroll()
+            .child(account).child(langs).child(device).child(about)
+            .into_any_element()
     }
 
     fn rescan(&mut self) {
         self.vita = vita::find();
-        self.status = if self.vita.is_some() { "Vita detectada".into() } else { "No se encontró la Vita".into() };
+        self.status = t(if self.vita.is_some() { "vita-detected" } else { "vita-not-found" }).into();
     }
 
     fn rail(&self, cx: &mut Context<Self>) -> impl IntoElement {
@@ -253,6 +341,7 @@ impl Main {
             .child(btn("r-lib", "library", Tab::Library, cx))
             .child(btn("r-tr", "download", Tab::Transfers, cx))
             .child(div().flex_1())
+            .child(btn("r-set", "settings", Tab::Settings, cx))
             .child(
                 div().id("r-vita").size(px(48.)).rounded(px(14.)).flex().items_center().justify_center().cursor_pointer()
                     .hover(|s| s.bg(rgb(HOVER)))
@@ -277,7 +366,7 @@ impl Main {
                 }))
         };
         div().id("chips").px_6().pb_3().gap_2().flex().overflow_x_scroll()
-            .child(one("cat-all".into(), "Todo".into(), self.cat.is_none(), None, cx))
+            .child(one("cat-all".into(), t("all"), self.cat.is_none(), None, cx))
             .children(self.cats.iter().map(|(c, n)| one(format!("cat-{c}"), format!("{c} · {n}"), self.cat.as_ref() == Some(c), Some(c.clone()), cx)))
     }
 
@@ -299,17 +388,17 @@ impl Main {
             }))
     }
 
-    fn row(&self, id: &'static str, title: &'static str, list: &[usize], cx: &mut Context<Self>) -> Div {
+    fn row(&self, id: &'static str, title: String, list: &[usize], cx: &mut Context<Self>) -> Div {
         div().flex().flex_col().flex_none().gap_3()
             .child(div().flex().justify_between().items_end()
                 .child(div().text_xl().child(title))
-                .child(div().text_sm().text_color(rgb(DIM)).child(format!("{} apps", list.len()))))
+                .child(div().text_sm().text_color(rgb(DIM)).child(t1("apps", &[("count", list.len().to_string())]))))
             .child(div().id(id).flex().gap_4().overflow_x_scroll().pb_2().children(list.iter().map(|&i| self.poster(i, 150., cx))))
     }
 
     fn home(&self, cx: &mut Context<Self>) -> AnyElement {
         let hero = self.popular.iter().copied().find(|&i| self.apps[i].cover_url.is_some()).or(self.popular.first().copied());
-        let Some(hi) = hero else { return empty("house", "Sin catálogo") };
+        let Some(hi) = hero else { return empty("house", t("no-catalog")) };
         let a = &self.apps[hi];
         let mut banner = div().relative().flex_none().w_full().h(px(280.)).rounded(px(20.)).overflow_hidden().bg(rgb(CARD)).border_1().border_color(rgb(LINE));
         if let Some(p) = images::path(a) {
@@ -319,16 +408,16 @@ impl Main {
             .child(div().absolute().size_full().bg(rgba((BG << 8) | 0xb8)))
             .child(
                 div().absolute().size_full().p_8().flex().flex_col().justify_end().gap_2()
-                    .child(div().text_xs().text_color(rgb(ACCENT)).child("DESTACADO · MÁS INSTALADA"))
+                    .child(div().text_xs().text_color(rgb(ACCENT)).child(t("featured")))
                     .child(div().text_3xl().child(a.name.clone()))
-                    .child(div().text_color(rgb(DIM)).child(format!("{} · {} instalaciones", a.author.clone().unwrap_or_default(), a.install_count.unwrap_or(0))))
+                    .child(div().text_color(rgb(DIM)).child(format!("{} · {}", a.author.clone().unwrap_or_default(), t1("installs", &[("count", thousands(a.install_count.unwrap_or(0)))]))))
                     .child(div().flex().gap_2().pt_2()
-                        .child(div().id("hero-install").px_5().py(px(10.)).rounded(px(12.)).bg(rgb(TEXT)).text_color(rgb(BG)).cursor_pointer().flex().items_center().gap_2().child(icon("play", 16., BG)).child("Instalar")
+                        .child(div().id("hero-install").px_5().py(px(10.)).rounded(px(12.)).bg(rgb(TEXT)).text_color(rgb(BG)).cursor_pointer().flex().items_center().gap_2().child(icon("play", 16., BG)).child(t("install"))
                             .on_click(cx.listener(move |this, _, _, cx| {
                                 this.start_install(hi);
                                 cx.notify();
                             })))
-                        .child(div().id("hero-details").px_5().py(px(10.)).rounded(px(12.)).bg(rgb(HOVER)).cursor_pointer().child("Detalles")
+                        .child(div().id("hero-details").px_5().py(px(10.)).rounded(px(12.)).bg(rgb(HOVER)).cursor_pointer().child(t("details"))
                             .on_click(cx.listener(move |this, _, _, cx| {
                                 this.selected = Some(hi);
                                 cx.notify();
@@ -336,8 +425,8 @@ impl Main {
             );
         div().id("home").size_full().px_6().pb_6().gap_6().flex().flex_col().overflow_y_scroll()
             .child(banner)
-            .child(self.row("row-pop", "Más instaladas", &self.popular, cx))
-            .child(self.row("row-rated", "Mejor valoradas", &self.rated, cx))
+            .child(self.row("row-pop", t("most-installed"), &self.popular, cx))
+            .child(self.row("row-rated", t("top-rated"), &self.rated, cx))
             .into_any_element()
     }
 
@@ -377,7 +466,7 @@ impl Main {
                                     }
                                 }
                                 if a.title_id.as_deref().is_some_and(|t| have.contains(t)) {
-                                    cover = cover.child(div().absolute().top(px(8.)).left(px(8.)).child(chip("Instalado", OK)).bg(rgba((BG << 8) | 0xcc)).rounded_full());
+                                    cover = cover.child(div().absolute().top(px(8.)).left(px(8.)).child(chip(t("installed"), OK)).bg(rgba((BG << 8) | 0xcc)).rounded_full());
                                 }
                                 div()
                                     .id(("card", i))
@@ -412,12 +501,12 @@ impl Main {
         let bytes = |v: &Option<String>| v.as_deref().and_then(|s| s.parse::<u64>().ok()).filter(|&n| n > 0);
         let fmt = |n: u64| if n >= 1 << 30 { format!("{:.2} GB", n as f64 / (1u64 << 30) as f64) } else { size(n) };
         let total = bytes(&a.size).unwrap_or(0) + bytes(&a.data_size).unwrap_or(0);
-        let stat = |ic: &'static str, label: &'static str, v: String| {
+        let stat = |ic: &'static str, label: String, v: String| {
             div().flex_1().p_2().rounded(px(10.)).bg(rgb(CARD)).flex().flex_col().gap_1()
                 .child(div().flex().items_center().gap_1().text_xs().text_color(rgb(DIM)).child(icon(ic, 12., DIM)).child(label))
                 .child(div().text_sm().child(v))
         };
-        let section = |title: &'static str, body: String| {
+        let section = |title: String, body: String| {
             div().flex().flex_col().gap_1().child(div().text_xs().text_color(rgb(DIM)).child(title)).child(div().text_sm().child(body))
         };
         let clip = |t: &str, n: usize| {
@@ -448,18 +537,18 @@ impl Main {
                 .child(div().flex().items_center().gap_1().text_color(rgb(DIM)).child(icon("download", 14., DIM)).child(thousands(a.install_count.unwrap_or(0))))
                 .child(div().flex().items_center().gap_1().text_color(rgb(DIM)).child(icon("heart", 14., DIM)).child(thousands(a.likes_count.unwrap_or(0)))));
         if a.download_url.is_some() || a.data_url.is_some() {
-            d = d.child(Button::new("install").label("Instalar en la Vita").on_click(cx.listener(move |this, _, _, cx| {
+            d = d.child(Button::new("install").label(t("install-on-vita")).on_click(cx.listener(move |this, _, _, cx| {
                 this.start_install(i);
                 cx.notify();
             })));
         }
         d = d.child(
             div().flex().gap_2()
-                .child(stat("hard-drive", "Tamaño", if total > 0 { fmt(total) } else { "—".into() }))
-                .child(stat("calendar", "Actualizado", a.release_date.clone().filter(|r| !r.is_empty()).unwrap_or("—".into()))),
+                .child(stat("hard-drive", t("size"), if total > 0 { fmt(total) } else { "—".into() }))
+                .child(stat("calendar", t("updated"), a.release_date.clone().filter(|r| !r.is_empty()).unwrap_or("—".into()))),
         );
         if !desc.trim().is_empty() {
-            d = d.child(section("DESCRIPCIÓN", clip(desc, 900)));
+            d = d.child(section(t("description"), clip(desc, 900)));
         }
         if !a.screenshot_urls.is_empty() {
             d = d.child(div().flex().flex_col().gap_2().child(div().text_xs().text_color(rgb(DIM)).child("CAPTURAS")).child(
@@ -473,12 +562,12 @@ impl Main {
             ));
         }
         if let Some(r) = a.requirements.as_deref().filter(|r| !r.trim().is_empty()) {
-            d = d.child(section("REQUISITOS", clip(r, 400)));
+            d = d.child(section(t("requirements"), clip(r, 400)));
         }
         if let Some(c) = a.changelog.as_deref().filter(|c| !c.trim().is_empty()) {
-            d = d.child(section("NOVEDADES", clip(c, 600)));
+            d = d.child(section(t("changelog"), clip(c, 600)));
         }
-        d.child(Button::new("close").label("Cerrar").on_click(cx.listener(|this, _, _, cx| {
+        d.child(Button::new("close").label(t("close")).on_click(cx.listener(|this, _, _, cx| {
             this.selected = None;
             cx.notify();
         })))
@@ -486,7 +575,7 @@ impl Main {
 
     fn library(&self) -> AnyElement {
         let Some(v) = &self.vita else {
-            return empty("gamepad-2", "Conecta la Vita por USB (modo USB de VitaShell) y pulsa «Buscar Vita».");
+            return empty("gamepad-2", t("library-empty"));
         };
         let by_tid: std::collections::HashMap<&str, &api::App> =
             self.apps.iter().filter_map(|a| Some((a.title_id.as_deref()?, a))).collect();
@@ -501,15 +590,15 @@ impl Main {
             .child(div().text_color(rgb(DIM)).child(format!(
                 "{} · {} · {}",
                 v.root.display(),
-                v.auth.as_ref().map(|a| format!("{} ({})", a.username, a.role)).unwrap_or_else(|| "sin sesión".into()),
+                v.auth.as_ref().map(|a| format!("{} ({})", a.username, a.role)).unwrap_or_else(|| t("no-session")),
                 v.client_id.as_deref().map(|c| format!("client {}", &c[..c.len().min(8)])).unwrap_or_default()
             )))
             .children(v.apps.iter().map(|a| {
                 let cat = by_tid.get(a.title_id.as_str());
                 let tag = match (a.state.as_deref(), cat) {
-                    (Some("outdated"), _) => ("actualización", WARN),
-                    (_, Some(_)) => ("en catálogo", OK),
-                    _ => ("local", DIM),
+                    (Some("outdated"), _) => (t("state-update"), WARN),
+                    (_, Some(_)) => (t("state-catalog"), OK),
+                    _ => (t("state-local"), DIM),
                 };
                 div().flex().items_center().gap_3().px_3().py_2().rounded(px(10.)).bg(rgb(CARD))
                     .child(div().flex_1().child(a.title.clone()))
@@ -522,23 +611,23 @@ impl Main {
 
     fn transfers_view(&self) -> AnyElement {
         if self.transfers.is_empty() {
-            return empty("download", "Aún no hay transferencias. Elige una app y pulsa «Instalar en la Vita».");
+            return empty("download", t("transfers-empty"));
         }
-        div().p_4().gap_2().flex().flex_col().size_full().children(self.transfers.iter().rev().map(|t| {
-            let (d, tot) = (t.progress.done.load(Relaxed), t.progress.total.load(Relaxed));
-            let line = match t.result.lock().unwrap().clone() {
+        div().p_4().gap_2().flex().flex_col().size_full().children(self.transfers.iter().rev().map(|tr| {
+            let (d, tot) = (tr.progress.done.load(Relaxed), tr.progress.total.load(Relaxed));
+            let line = match tr.result.lock().unwrap().clone() {
                 Some(m) => m,
                 None if tot > 0 => format!("{} / {} ({}%)", size(d), size(tot), d * 100 / tot),
-                None => format!("{} descargados…", size(d)),
+                None => t1("downloaded", &[("size", size(d))]),
             };
-            let done = t.result.lock().unwrap().clone();
+            let done = tr.result.lock().unwrap().clone();
             let (frac, col) = match &done {
-                Some(m) if m.starts_with("Error") => (1.0, ERR),
+                Some(m) if m.starts_with(&t("error")) => (1.0, ERR),
                 Some(_) => (1.0, OK),
                 None if tot > 0 => (d as f32 / tot as f32, ACCENT),
                 None => (0.0, ACCENT),
             };
-            div().p_3().gap_2().flex().flex_col().rounded(px(12.)).bg(rgb(CARD)).child(t.name.clone())
+            div().p_3().gap_2().flex().flex_col().rounded(px(12.)).bg(rgb(CARD)).child(tr.name.clone())
                 .child(progress_bar(frac, col))
                 .child(div().text_sm().text_color(rgb(DIM)).child(line))
         }))
@@ -552,19 +641,21 @@ impl Render for Main {
             return self.splash();
         }
         let vita_line: SharedString = match &self.vita {
-            Some(v) => format!("Vita: {} · {} apps", v.auth.as_ref().map(|a| a.username.as_str()).unwrap_or("sin sesión"), v.apps.len()).into(),
-            None => "Vita no detectada".into(),
+            Some(v) => t1("vita-status", &[("user", v.auth.as_ref().map(|a| a.username.clone()).unwrap_or_else(|| t("no-session"))), ("count", v.apps.len().to_string())]).into(),
+            None => t("vita-none").into(),
         };
         let body = match self.tab {
             Tab::Catalog if self.cat.is_none() && self.query.read(cx).value().is_empty() => self.home(cx),
             Tab::Catalog => self.grid(w, cx).into_any_element(),
             Tab::Library => self.library(),
             Tab::Transfers => self.transfers_view(),
+            Tab::Settings => self.settings(cx),
         };
         let (title, count): (String, String) = match self.tab {
-            Tab::Catalog => (self.cat.clone().unwrap_or("Inicio".into()), format!("{} apps", self.filtered.len())),
-            Tab::Library => ("Biblioteca".into(), format!("{} apps", self.vita.as_ref().map_or(0, |v| v.apps.len()))),
-            Tab::Transfers => ("Transferencias".into(), format!("{}", self.transfers.len())),
+            Tab::Catalog => (self.cat.clone().unwrap_or_else(|| t("home")), t1("apps", &[("count", self.filtered.len().to_string())])),
+            Tab::Library => (t("library"), t1("apps", &[("count", self.vita.as_ref().map_or(0, |v| v.apps.len()).to_string())])),
+            Tab::Transfers => (t("transfers"), self.transfers.len().to_string()),
+            Tab::Settings => (t("settings"), String::new()),
         };
         div()
             .size_full()
@@ -582,20 +673,28 @@ impl Render for Main {
                                     .child(div().text_3xl().child(title))
                                     .child(div().text_sm().text_color(rgb(DIM)).child(count))
                                     .child(div().flex_1())
+                                    .child(
+                                        chip(i18n::current().code().to_uppercase(), ACCENT).id("lang").cursor_pointer()
+                                            .on_click(cx.listener(|this, _, _, cx| {
+                                                i18n::cycle();
+                                                this.status = "".into();
+                                                cx.notify();
+                                            })),
+                                    )
                                     .child(chip(vita_line, if self.vita.is_some() { OK } else { DIM }))
                                     .child(div().w(px(300.)).child(Input::new(&self.query))),
                             )
                             .children((self.tab == Tab::Catalog).then(|| self.chips(cx)))
                             .child(div().flex_1().flex().flex_col().overflow_hidden().child(body)),
                     )
-                    .children(self.selected.map(|i| self.detail(i, cx))),
+                    .children(self.selected.filter(|_| self.tab == Tab::Catalog).map(|i| self.detail(i, cx))),
             )
             .child(
                 div().h(px(36.)).px_6().flex().items_center().gap_6().border_t_1().border_color(rgb(LINE)).bg(rgb(HEADER)).text_xs().text_color(rgb(DIM))
-                    .child("Clic · Detalles").child(div().flex().items_center().gap_1().child(icon("gamepad-2", 14., DIM)).child("Buscar Vita"))
+                    .child(t("shortcut-click")).child(div().flex().items_center().gap_1().child(icon("gamepad-2", 14., DIM)).child(t("find-vita")))
                     .child(div().flex_1())
                     .child(div().text_color(rgb(OK)).child("●"))
-                    .child(format!("{} · {} apps", self.status, self.filtered.len())),
+                    .child(format!("{} · {}", self.status, t1("apps", &[("count", self.filtered.len().to_string())]))),
             )
             .with_animation("enter", Animation::new(Duration::from_millis(350)), |e, p| e.opacity(p))
             .into_any_element()
@@ -604,6 +703,7 @@ impl Render for Main {
 
 fn main() {
     dotenvy::dotenv().ok();
+    i18n::init();
     application().with_assets(assets::AllAssets).run(|cx| {
         init(cx);
         open_window(WindowOptions::default(), cx, |w, cx| cx.new(|cx| Main::new(w, cx))).expect("open window");

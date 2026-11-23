@@ -2,7 +2,7 @@
 use crate::api::{self, App, Version};
 use std::{fs, path::PathBuf};
 
-fn dir() -> PathBuf {
+pub fn dir() -> PathBuf {
     let base = std::env::var_os("XDG_CACHE_HOME").map(PathBuf::from)
         .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".cache")))
         .or_else(|| std::env::var_os("LOCALAPPDATA").map(PathBuf::from))

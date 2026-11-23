@@ -1,0 +1,8 @@
+[Desktop Entry]
+Type=Application
+Name=VitaForge
+Comment=Catálogo e instalador de apps para PS Vita
+Exec=vitaforge-client
+Icon=vitaforge-client
+Categories=Utility;Game;
+Terminal=false

@@ -5,3 +5,5 @@ pub mod install;
 pub mod sfo;
 pub mod vita;
 pub mod images;
+pub mod i18n;
+pub mod account;

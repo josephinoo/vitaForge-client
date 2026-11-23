@@ -5,9 +5,10 @@ use serde::{Deserialize, Serialize};
 /// API base URL from the VITAFORGE_API env var (set in .env, never committed).
 pub fn base() -> Result<&'static str, String> {
     static B: std::sync::OnceLock<Option<String>> = std::sync::OnceLock::new();
-    B.get_or_init(|| std::env::var("VITAFORGE_API").ok().map(|v| v.trim().trim_end_matches('/').to_string()).filter(|v| v.starts_with("http")))
+    // runtime env/.env first (dev), else the value baked in at build time by CI (release builds)
+    B.get_or_init(|| std::env::var("VITAFORGE_API").ok().or_else(|| option_env!("VITAFORGE_API").map(String::from)).map(|v| v.trim().trim_end_matches('/').to_string()).filter(|v| v.starts_with("http")))
         .as_deref()
-        .ok_or_else(|| "Falta VITAFORGE_API en .env (ver .env.example)".to_string())
+        .ok_or_else(|| crate::i18n::t("missing-config"))
 }
 
 /// Server origin (scheme + host) derived from the base URL, for relative image paths.
